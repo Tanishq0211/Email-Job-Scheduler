@@ -1,7 +1,5 @@
 import { Router } from "express";
-import passport from "passport";
 import rateLimit from "express-rate-limit";
-import { config } from "../config/env.js";
 import {
   startGoogleAuth,
   googleCallback,
@@ -21,17 +19,12 @@ const authLimiter = rateLimit({
 /** /auth/google + /auth/google/callback — Google OAuth redirect flow. */
 export const googleAuthRouter = Router();
 googleAuthRouter.get("/google", authLimiter, startGoogleAuth);
-googleAuthRouter.get(
-  "/google/callback",
-  authLimiter,
-  // Strategy-level failures (bad credentials, denied consent) go back to
-  // the SPA login page, not a backend 404.
-  passport.authenticate("google", {
-    session: false,
-    failureRedirect: `${config.frontendUrl}/login?error=oauth_failed`,
-  }),
-  googleCallback,
-);
+googleAuthRouter.get("/google/callback", authLimiter, googleCallback);
+// NOTE: the Google strategy must run EXACTLY ONCE per callback. The
+// strategy exchanges the single-use authorization code at Google's token
+// endpoint; running it again (e.g. as middleware + controller) makes the
+// second exchange fail with 400 invalid_grant ("Bad Request"). Failure
+// handling (including SPA redirects) lives inside googleCallback.
 
 /** /api/auth/* — session endpoints. */
 export const sessionRouter = Router();
