@@ -1,4 +1,3 @@
-import type { Email } from "@prisma/client";
 import { emailJobId, SEND_EMAIL_JOB_NAME } from "@reachinbox/shared";
 import { emailQueue } from "./connection.js";
 import { childLogger } from "../utils/logger.js";
@@ -12,7 +11,7 @@ export interface QueuedEmail {
 
 /**
  * Enqueue one BullMQ delayed job per email with a deterministic jobId
- * (`email:<emailId>`). The deterministic ID makes re-enqueueing an
+ * (`email_<emailId>`). The deterministic ID makes re-enqueueing an
  * idempotent no-op while the job still exists, which is what keeps
  * startup reconciliation safe.
  */
@@ -39,5 +38,3 @@ export async function jobExists(emailId: string): Promise<boolean> {
   // completed/failed jobs no longer exist for scheduling purposes
   return state !== "completed" && state !== "failed";
 }
-
-export type { Email };

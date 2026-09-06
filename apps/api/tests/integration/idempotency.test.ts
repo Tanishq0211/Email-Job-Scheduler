@@ -7,6 +7,7 @@ import {
   claimForProcessing,
   markSent,
   revertToScheduled,
+  recoverStuckProcessing,
 } from "../../src/services/email/email-state.service.js";
 import { enqueueEmailJobs, jobExists } from "../../src/queues/email.queue.js";
 import { reconcileEmailJobs } from "../../src/services/scheduler/job-reconciliation.service.js";
@@ -59,11 +60,10 @@ async function createEmail(status = "scheduled") {
 describe.skipIf(!(await servicesUp()))("Idempotency and reconciliation", () => {
   it("lets exactly one worker claim an email (atomic state transition)", async () => {
     const email = await createEmail();
-    const claims = await Promise.all([
-      claimForProcessing(email.id),
-      claimForProcessing(email.id),
-      claimForProcessing(email.id),
-    ]);
+    // §46 race test: many concurrent workers, one logical claim.
+    const claims = await Promise.all(
+      Array.from({ length: 20 }, () => claimForProcessing(email.id)),
+    );
     expect(claims.filter(Boolean)).toHaveLength(1);
   });
 
@@ -78,6 +78,38 @@ describe.skipIf(!(await servicesUp()))("Idempotency and reconciliation", () => {
 
     const claim = await claimForProcessing(email.id);
     expect(claim).toBe(false);
+  });
+
+  it("recovers a stale processing claim after a mid-send crash, never a fresh one", async () => {
+    const email = await createEmail();
+    await claimForProcessing(email.id);
+    const claimed = await prisma.email.findUniqueOrThrow({
+      where: { id: email.id },
+    });
+    expect(claimed.status).toBe("processing");
+
+    // Fresh claim (a live worker is mid-send): must NOT be stolen.
+    const fresh = await recoverStuckProcessing(email.id, claimed.updatedAt, 20_000);
+    expect(fresh).toBe(false);
+
+    // Simulate the claim aging past the staleness cutoff (worker died).
+    await prisma.$executeRaw`UPDATE "Email" SET "updatedAt" = now() - interval '60 seconds' WHERE id = ${email.id}::uuid`;
+    const stale = await prisma.email.findUniqueOrThrow({
+      where: { id: email.id },
+    });
+    const recovered = await recoverStuckProcessing(
+      email.id,
+      stale.updatedAt,
+      20_000,
+    );
+    expect(recovered).toBe(true);
+    const after = await prisma.email.findUniqueOrThrow({ where: { id: email.id } });
+    expect(after.status).toBe("scheduled");
+
+    // Recovery is single-winner: a second recovery with the same
+    // observation finds nothing to do.
+    const again = await recoverStuckProcessing(email.id, stale.updatedAt, 20_000);
+    expect(again).toBe(false);
   });
 
   it("reschedules instead of dropping when the hourly limit blocks", async () => {

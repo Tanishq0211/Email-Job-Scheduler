@@ -110,28 +110,37 @@ curl "http://localhost:4000/api/emails/search?q=hello&page=1" --cookie "..."
 
 ## Demo script
 
-```bash
-# .env for a fast demo:
+Set these in `.env` for a fast, visible demo:
+
+```env
 WORKER_CONCURRENCY=3
 MIN_SEND_DELAY_MS=2000
 MAX_EMAILS_PER_HOUR=3
 ```
 
-1. **Schedule** — Compose → upload `examples/sample-leads.csv` (you'll see
-   valid/invalid/duplicate stats) → start time now → Schedule.
-2. **Watch throttling** — with `MAX_EMAILS_PER_HOUR=3`, the first 3 emails
-   send, the rest are rescheduled to the next UTC hour, and (if Slack is
-   connected) **one** Slack alert fires for the window.
-3. **Search** — use the dashboard search (Elasticsearch, server-side).
-4. **Restart safety** —
-   ```bash
-   # schedule an email ~1 min in the future, then:
-   # stop the dev processes (Ctrl+C), wait past the fire time, then:
-   npm run dev:worker
-   ```
-   The delayed job lives in Redis; the restarted worker picks it up and
-   sends it. `apps/api/scripts/verify-restart.ts` automates this check.
-5. **Bull Board** — observe delayed → active → completed transitions live.
+### 5-Minute Demo
+
+1. `docker compose up -d && npm run dev` → open http://localhost:5173
+2. **Login with Google** → land on the dashboard.
+3. **Compose** → upload `examples/sample-leads.csv` → show the detected
+   valid/invalid/duplicate stats.
+4. Pick a sender, set start time ~1 minute out, delay 2s, hourly limit 3
+   → **Schedule**.
+5. Open **Bull Board** (http://localhost:5173/admin/queues) → show the
+   9 delayed jobs (9 valid addresses in the sample CSV, 2 removed).
+6. Back on the dashboard → **Scheduled Emails** shows all 9.
+7. Watch the first 3 send, then the rest defer to the next UTC hour
+   (visible in Bull Board as delayed jobs ~1h out).
+8. **Restart-safety**: `Ctrl+C` the dev processes, wait past the start
+   time, then `npm run dev:worker` — the delayed job fires and the email
+   is delivered. (Or run `npx tsx scripts/verify-restart.ts schedule`
+   then `check` to automate it.)
+9. **Sent Emails** shows delivery states; click through to Ethereal's
+   preview link for the actual message.
+10. **Search** in the dashboard (Elasticsearch) for a recipient or
+    subject fragment.
+11. With Slack connected, the hourly-limit block posts **one**
+    notification for the window — even though 6 emails were blocked.
 
 ---
 
@@ -166,6 +175,16 @@ remaining wait for the min-delay gate — no attempt is consumed, no email is
 lost, and order is preserved as much as practical (jobs keep their original
 delay order within the next window).
 
+**Scope**: both controls are **per sender**. Two campaigns from the same
+sender share the same hourly counter and send gate — mirroring how a real
+mailbox/provider limit works.
+
+**Which hourly limit applies**: the compose request's `hourlyLimit` is
+stored per email, and the worker enforces
+`min(sender.hourlyLimit, campaign.hourlyLimit)`. A campaign can tighten the
+sender's safety cap but never raise it; because the counter is shared per
+sender, the most restrictive active limit naturally wins.
+
 Worker concurrency (`WORKER_CONCURRENCY`) controls how many jobs are
 *processed* simultaneously; the Redis controls throttle actual *sends*.
 Ten concurrent workers with a 2s min delay still produce one send per 2s.
@@ -173,6 +192,29 @@ Ten concurrent workers with a 2s min delay still produce one send per 2s.
 Failed SMTP attempts release their hourly slot (Lua DECR, floored at 0) and
 are retried with exponential backoff (3 attempts); permanent failures are
 marked `failed` with a stored `lastError`.
+
+### Attempt counting semantics
+`Email.attempts` counts **SMTP delivery attempts only**. Rate-limit
+deferrals and min-delay waits are reschedules, not attempts, and never
+increment the counter or consume a BullMQ retry. A transient SMTP error
+reverts the email to `scheduled` so the next BullMQ retry can re-claim it;
+the final attempt marks it `failed`.
+
+### The SMTP crash window (honest exactly-once note)
+No email system can guarantee mathematically exactly-once SMTP delivery: if
+the process dies after the SMTP server accepted the message but before the
+DB commit, the job will be retried. This system narrows that window to the
+strongest practical design:
+
+1. deterministic BullMQ job id → no duplicate jobs;
+2. atomic `scheduled → processing` DB claim → no duplicate *processing*;
+3. **deterministic RFC Message-ID** (`<emailId@reachinbox.scheduler>`) → a
+   retried send produces the *same* message identity, which receiving
+   servers and clients collapse instead of showing two copies.
+
+So the practical guarantee is exactly-once *processing* and
+effectively-once *delivery*, with the classic at-least-once SMTP caveat
+documented rather than hidden.
 
 ### PostgreSQL vs Elasticsearch
 PostgreSQL is the source of truth; Elasticsearch is a projection. Email
@@ -191,7 +233,7 @@ when available). Tokens are encrypted with AES-256-GCM and never logged.
 ## Testing
 
 ```bash
-npm test        # 43 tests: unit + integration + e2e
+npm test        # 47 tests: unit + integration + e2e
 ```
 
 Integration tests use the real Docker services (PostgreSQL, Redis,
@@ -199,22 +241,28 @@ Elasticsearch) and skip cleanly if those aren't running. The e2e test
 performs a **real Ethereal SMTP send** and verifies the Elasticsearch
 projection (requires `SMTP_USER`/`SMTP_PASSWORD` in `.env`).
 
-Covered explicitly: atomic claim/idempotency, duplicate-job safety,
-hourly-limit rescheduling (limit 1 → 2nd slot blocked), concurrency safety
-(20 concurrent acquisitions of a 5-slot limit → exactly 5 win), slot release
-on failure, startup reconciliation idempotence, CSV parsing (headers,
-duplicates, invalid rows), schedule-time math, OAuth state signing, schedule
-API authorization (ownership + 401s), and the full
-schedule → worker → SMTP → DB → Elasticsearch flow.
+Covered explicitly: atomic claim/idempotency (including a 20-way concurrent
+claim race), duplicate-job safety, hourly-limit rescheduling (limit 1 → 2nd
+slot blocked), concurrency safety (20 concurrent acquisitions of a 5-slot
+limit → exactly 5 win), 1000-recipient campaigns (999 rows + 999 uniquely
+identified delayed jobs), slot release on failure, startup reconciliation
+idempotence, CSV parsing (headers, duplicates, invalid rows), schedule-time
+math, OAuth state signing, Slack alert deduplication (20 blocks → one alert
+key; next window gets a fresh key) and clean refusal when Slack is not
+configured, schedule API authorization (ownership + 401s), and the full
+schedule → worker → SMTP → DB → Elasticsearch flow with a real Ethereal
+delivery.
 
 ---
 
 ## Trade-offs & honest notes
 
-- **Ordering after rate-limit overflow** is preserved within a rescheduled
-  window, but if multiple windows are missed, jobs merge into the next
-  window in their original relative order — absolute per-email timestamps
-  are no longer guaranteed after a block.
+- **Ordering after rate-limit overflow**: blocked jobs are all re-delayed
+  to the same next-window boundary, so within that window the min-delay
+  gate is acquired in near-original order (BullMQ wakes delayed jobs in
+  timestamp order), but concurrent workers may acquire the gate slightly
+  out of order. Strict per-recipient FIFO across windows is **not**
+  guaranteed and we don't claim it.
 - **Elasticsearch reconciliation** is boot-time, not continuous; a long ES
   outage while the process stays up leaves the projection stale until
   restart (documented; DB stays correct).

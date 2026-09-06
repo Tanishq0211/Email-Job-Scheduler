@@ -75,6 +75,8 @@ export async function scheduleCampaign(
     recipient,
     subject: input.subject,
     body: input.body,
+    // A campaign may only tighten the sender's safety cap, never raise it.
+    hourlyLimit: Math.min(input.senderHourlyLimit, input.hourlyLimit),
     scheduledAt: sendTimes[i],
     status: "scheduled" as const,
     bullJobId: "", // set below from the deterministic id

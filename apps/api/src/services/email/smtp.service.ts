@@ -10,6 +10,10 @@ export interface SendEmailInput {
   to: string;
   subject: string;
   body: string;
+  /** Email row id — used to derive a deterministic RFC Message-ID so a
+   * crash between SMTP accept and DB commit produces the same message on
+   * retry instead of a visually-duplicated new one. */
+  deterministicId?: string;
 }
 
 export interface SendEmailResult {
@@ -39,6 +43,9 @@ export async function sendEmail(input: SendEmailInput): Promise<SendEmailResult>
     to: input.to,
     subject: input.subject,
     text: input.body,
+    ...(input.deterministicId
+      ? { messageId: `<${input.deterministicId}@reachinbox.scheduler>` }
+      : {}),
   });
 
   const previewUrl = nodemailer.getTestMessageUrl(info);

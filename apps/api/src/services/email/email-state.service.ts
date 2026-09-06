@@ -55,6 +55,34 @@ export async function revertToScheduled(emailId: string): Promise<void> {
   });
 }
 
+/**
+ * A `processing` claim whose holder crashed mid-send (BullMQ re-delivers
+ * the stalled job once its lock expires) is recovered only if the claim is
+ * stale. The conditional update matches the exact `updatedAt` observed by
+ * the caller, so two recoverers cannot both win, and a live worker that
+ * claimed recently is never stolen from.
+ */
+export async function recoverStuckProcessing(
+  emailId: string,
+  observedUpdatedAt: Date,
+  stalenessCutoffMs: number,
+): Promise<boolean> {
+  const cutoff = new Date(observedUpdatedAt.getTime() + stalenessCutoffMs);
+  if (cutoff.getTime() > Date.now()) return false; // claim still fresh
+  const result = await prisma.email.updateMany({
+    where: {
+      id: emailId,
+      status: "processing",
+      updatedAt: observedUpdatedAt,
+    },
+    data: { status: "scheduled" },
+  });
+  if (result.count === 1) {
+    log.info({ emailId }, "recovered stale processing claim after crash");
+  }
+  return result.count === 1;
+}
+
 /** Increment the attempt counter (SMTP attempts only, never rate-limit waits). */
 export async function incrementAttempts(emailId: string): Promise<void> {
   await prisma.email.update({

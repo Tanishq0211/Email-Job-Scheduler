@@ -1,6 +1,7 @@
 import { Router } from "express";
 import passport from "passport";
 import rateLimit from "express-rate-limit";
+import { config } from "../config/env.js";
 import {
   startGoogleAuth,
   googleCallback,
@@ -23,7 +24,12 @@ googleAuthRouter.get("/google", authLimiter, startGoogleAuth);
 googleAuthRouter.get(
   "/google/callback",
   authLimiter,
-  passport.authenticate("google", { session: false, failureRedirect: "/login" }),
+  // Strategy-level failures (bad credentials, denied consent) go back to
+  // the SPA login page, not a backend 404.
+  passport.authenticate("google", {
+    session: false,
+    failureRedirect: `${config.frontendUrl}/login?error=oauth_failed`,
+  }),
   googleCallback,
 );
 

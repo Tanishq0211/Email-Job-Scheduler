@@ -8,6 +8,7 @@ import {
   markFailed,
   revertToScheduled,
   incrementAttempts,
+  recoverStuckProcessing,
 } from "../services/email/email-state.service.js";
 import {
   acquireSendSlot,
@@ -19,6 +20,10 @@ import { notifyRateLimitReached } from "../services/slack/slack.notification.ser
 import { prisma } from "../db/prisma.js";
 
 const log = childLogger({ operation: "email.worker" });
+
+/** Claims older than this are considered abandoned by a crashed worker
+ * (BullMQ re-delivers stalled jobs ~30s after the lock expires). */
+const STALE_CLAIM_MS = 20_000;
 
 /**
  * Email send worker.
@@ -55,7 +60,25 @@ export function startEmailWorker() {
         jobLog.info("email already sent; skipping duplicate processing");
         return;
       }
-      if (email.status !== "scheduled" && email.status !== "processing") {
+
+      if (email.status === "processing") {
+        // This job was re-delivered after a worker crash mid-send. If the
+        // previous claim is stale, hand the email back to `scheduled` so
+        // the atomic claim below can succeed; if it is fresh, another
+        // worker holds it and we exit safely.
+        const recovered = await recoverStuckProcessing(
+          emailId,
+          email.updatedAt,
+          STALE_CLAIM_MS,
+        );
+        if (!recovered) {
+          jobLog.info("email actively processing elsewhere; skipping");
+          return;
+        }
+        email.status = "scheduled";
+      }
+
+      if (email.status !== "scheduled") {
         jobLog.info({ status: email.status }, "email not sendable; skipping");
         return;
       }
@@ -68,10 +91,18 @@ export function startEmailWorker() {
       }
       jobLog.info("job claimed");
 
+      // Effective hourly cap: a campaign's requested limit may tighten the
+      // sender's configured safety cap but never exceed it. The shared
+      // per-sender Redis counter makes the most restrictive limit win.
+      const hourlyLimit = Math.min(
+        email.sender.hourlyLimit,
+        email.hourlyLimit ?? email.sender.hourlyLimit,
+      );
+
       const slot = await acquireSendSlot(
         redis,
         email.senderId,
-        email.sender.hourlyLimit,
+        hourlyLimit,
         email.sender.minDelayMs,
       );
 
@@ -88,7 +119,7 @@ export function startEmailWorker() {
             userId: email.userId,
             senderId: email.senderId,
             senderEmail: email.sender.email,
-            hourlyLimit: email.sender.hourlyLimit,
+            hourlyLimit,
           });
         } else {
           jobLog.info(
@@ -108,6 +139,11 @@ export function startEmailWorker() {
           to: email.recipient,
           subject: email.subject,
           body: email.body,
+          // Deterministic Message-ID: if the process dies after the SMTP
+          // server accepted the message but before the DB commit, a retry
+          // re-sends the same Message-ID, which receiving servers treat as
+          // the same message. (Best practical guarantee — see README.)
+          deterministicId: email.id,
         });
 
         const marked = await markSent(

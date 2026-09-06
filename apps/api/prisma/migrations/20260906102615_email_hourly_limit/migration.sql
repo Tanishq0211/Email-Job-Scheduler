@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "Email" ADD COLUMN     "hourlyLimit" INTEGER NOT NULL DEFAULT 200;

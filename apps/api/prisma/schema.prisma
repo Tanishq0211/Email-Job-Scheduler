@@ -62,6 +62,9 @@ model Email {
   recipient   String
   subject     String
   body        String
+  // Effective per-campaign hourly cap: min(sender cap, requested cap).
+  // Enforced by the worker's Redis rate limiter for this email.
+  hourlyLimit Int      @default(200)
   scheduledAt DateTime
   sentAt      DateTime?
   failedAt    DateTime?

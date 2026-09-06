@@ -36,6 +36,8 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     logger.info({ signal }, "shutting down");
     server.close();
+    // Force-exit if lingering keep-alive connections block a clean close.
+    setTimeout(() => process.exit(1), 10_000).unref();
     await prisma.$disconnect();
     await closeQueue();
     process.exit(0);
