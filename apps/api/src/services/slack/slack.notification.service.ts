@@ -9,9 +9,17 @@ const log = childLogger({ operation: "slack.notify" });
 
 /**
  * Notify the connected Slack workspace that a sender hit its hourly
- * rate limit. Deduplicated per (sender, hour window) with an atomic
- * Redis SET NX, so a burst of blocked emails produces exactly one alert.
- * A missing Slack connection is a no-op: the email system continues.
+ * rate limit. Semantics:
+ *
+ *  1. No Slack connection → no-op. The dedup key is NOT created, so a
+ *     later rate-limit event in the same hour can still notify once the
+ *     user connects Slack.
+ *  2. Exactly one alert per (sender, UTC hour window): the alert is
+ *     reserved atomically with Redis SET NX before delivery.
+ *  3. Delivery failure releases the reservation, allowing the next
+ *     rate-limit event to retry within the same hour.
+ *  4. Slack problems never affect email processing: errors are logged
+ *     and swallowed.
  */
 export async function notifyRateLimitReached(
   redis: Redis,
@@ -25,12 +33,12 @@ export async function notifyRateLimitReached(
 ): Promise<void> {
   const { userId, senderId, senderEmail, hourlyLimit } = params;
   const window = utcHourWindow(now);
+  const dedupKey = slackAlertKey(senderId, window);
 
+  let reserved = false;
   try {
-    const dedupKey = slackAlertKey(senderId, window);
-    const isNew = await redis.set(dedupKey, "1", "EX", 3600, "NX");
-    if (isNew !== "OK") return; // alert already sent for this window
-
+    // 1. Connection check first — no connection must not consume the
+    // one-alert-per-hour reservation.
     const connection = await prisma.slackConnection.findUnique({
       where: { userId },
     });
@@ -42,7 +50,13 @@ export async function notifyRateLimitReached(
       return;
     }
 
-    const windowStart = now.toISOString().slice(0, 13).replace("T", " ") + ":00 UTC";
+    // 2. Atomic exactly-one reservation per sender + window.
+    const reservedResult = await redis.set(dedupKey, "1", "EX", 3600, "NX");
+    if (reservedResult !== "OK") return; // alert already sent this window
+    reserved = true;
+
+    const windowStart =
+      now.toISOString().slice(0, 13).replace("T", " ") + ":00 UTC";
     const windowEnd = new Date(now.getTime() + 3_600_000)
       .toISOString()
       .slice(0, 13)
@@ -56,8 +70,8 @@ export async function notifyRateLimitReached(
       "Additional emails have been rescheduled to the next hour window.",
     ].join("\n");
 
-    // Prefer the incoming webhook (no token in the request path); fall
-    // back to chat.postMessage with the stored bot token.
+    // 3. Deliver: prefer the incoming webhook (no token in the request
+    // path); fall back to chat.postMessage with the stored bot token.
     const webhookUrl = connection.webhookUrl
       ? decryptToken(connection.webhookUrl)
       : null;
@@ -79,10 +93,28 @@ export async function notifyRateLimitReached(
       delivered = Boolean(result.ok);
     }
 
-    if (!delivered) throw new Error("Slack delivery failed");
+    if (!delivered) {
+      // 4. Release the reservation so a later rate-limit event in this
+      // hour can retry the notification.
+      await redis.del(dedupKey);
+      reserved = false;
+      log.warn(
+        { senderId, window },
+        "slack delivery failed; alert reservation released for retry",
+      );
+      return;
+    }
+
     log.info({ senderId, window }, "Slack rate-limit notification sent");
   } catch (err) {
-    // Never let a notification failure affect email processing.
+    // 5. Never let a notification failure affect email processing.
     log.error({ err, senderId, window }, "slack notification failed");
+    if (reserved) {
+      try {
+        await redis.del(dedupKey);
+      } catch {
+        // Redis unavailable — the key expires on its own (1h TTL).
+      }
+    }
   }
 }
