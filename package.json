@@ -1,0 +1,29 @@
+{
+  "name": "reachinbox-email-scheduler",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Production-ready Email Job Scheduler and Dashboard — ReachInbox hiring assignment",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "npm run build -w @reachinbox/shared && concurrently -n api,worker,web -c blue,yellow,magenta \"npm run dev -w @reachinbox/api\" \"npm run dev:worker -w @reachinbox/api\" \"npm run dev -w @reachinbox/web\"",
+    "dev:api": "npm run build -w @reachinbox/shared && npm run dev -w @reachinbox/api",
+    "dev:worker": "npm run build -w @reachinbox/shared && npm run dev:worker -w @reachinbox/api",
+    "dev:web": "npm run dev -w @reachinbox/web",
+    "build": "npm run build -w @reachinbox/shared && npm run build -w @reachinbox/api && npm run build -w @reachinbox/web",
+    "test": "npm run test -w @reachinbox/api",
+    "lint": "npm run lint -w @reachinbox/api && npm run lint -w @reachinbox/web",
+    "typecheck": "npm run typecheck -w @reachinbox/shared && npm run typecheck -w @reachinbox/api && npm run typecheck -w @reachinbox/web",
+    "db:migrate": "npm run db:migrate -w @reachinbox/api",
+    "db:generate": "npm run db:generate -w @reachinbox/api",
+    "db:seed": "npm run db:seed -w @reachinbox/api"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1"
+  }
+}
